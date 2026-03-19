@@ -15,7 +15,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
-from src.input._platform import (
+from input._platform import (
     BackendRule,
     is_linux,
     is_wayland,

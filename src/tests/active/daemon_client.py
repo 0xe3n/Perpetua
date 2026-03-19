@@ -31,13 +31,13 @@ import sys
 from typing import Optional
 
 try:
-    from service.daemon import send_daemon_command, DaemonCommand, Daemon
+    from daemon import send_daemon_command, DaemonCommand, Daemon
 except ImportError:
     # Fallback for when running as standalone script
     import os
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from service.daemon import send_daemon_command, DaemonCommand, Daemon
+    from daemon import send_daemon_command, DaemonCommand, Daemon
 
 # Encoder/Decoder for msgspec (defined once for efficiency)
 _encoder = msgspec.json.Encoder()

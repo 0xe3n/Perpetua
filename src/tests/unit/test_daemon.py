@@ -43,7 +43,7 @@ from event.notification import NotificationEvent, NotificationEventType
 
 _MOCK_PYNPUT()
 
-from service.daemon import (  # noqa: E402
+from daemon import (  # noqa: E402
     Daemon,
     DaemonCommand,
     DaemonAlreadyRunningException,

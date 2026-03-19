@@ -17,7 +17,7 @@
 
 from pynput.keyboard import HotKey
 
-from src.input._platform import BackendRule, is_linux, is_wayland, resolve_backend
+from input._platform import BackendRule, is_linux, is_wayland, resolve_backend
 
 _RULES = [
     # Linux: listener + Key/KeyCode always from uinput

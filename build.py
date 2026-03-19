@@ -270,7 +270,7 @@ class Builder:
                 self.log.error("Failed to install Nuitka")
                 return res.returncode
 
-        launcher_py = self.project_root / "launcher.py"
+        launcher_py = self.project_root / "src" / "launcher.py"
         output_exe = self.gui_exe
 
         # Check that the GUI executable exists

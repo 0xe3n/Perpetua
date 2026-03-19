@@ -109,7 +109,7 @@ class DaemonRunner:
 
     def run(self):
         """Run the daemon in this process."""
-        from service.daemon import main as daemon_main
+        from daemon import main as daemon_main
 
         self.clean_log_file()
         self.write_pid()

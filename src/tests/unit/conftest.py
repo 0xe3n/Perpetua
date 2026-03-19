@@ -476,7 +476,7 @@ async def daemon_instance(app_config, daemon_unix_socket_path):
     Automatically uses Unix socket on Unix systems, TCP on Windows.
     Mocks os.exit() to prevent actual process termination during tests.
     """
-    from service.daemon import Daemon
+    from daemon import Daemon
 
     # Choose socket path based on platform
     if sys.platform in ("win32", "cygwin"):
