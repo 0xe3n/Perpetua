@@ -24,7 +24,7 @@ from asyncio.queues import Queue
 
 import asyncio
 from dataclasses import dataclass
-from time import time
+from time import monotonic, time
 from typing import Callable, Dict, Optional, Any, List, Coroutine
 
 from config import ApplicationConfig
@@ -33,6 +33,11 @@ from network.protocol.message import ProtocolMessage, MessageBuilder
 from network.stream import StreamType
 from utils.logging import Logger, get_logger
 from utils.metrics import ConnectionMetrics, MetricsCollector
+
+# Drop partial chunk-reassembly buffers after this many seconds without progress.
+CHUNK_REASSEMBLY_TTL: float = 60.0
+# How often to walk _chunk_buffer looking for stale entries (seconds).
+CHUNK_GC_INTERVAL: float = 5.0
 
 
 @dataclass
@@ -67,6 +72,12 @@ class MessageExchangeConfig:
     auto_dispatch: bool = True
     receive_buffer_size: int = 65536  # bytes for asyncio receive buffer
     multicast: bool = False  # Whether to use multicast transport
+    # Max messages buffered for the consumer. When full, mouse/screen frames
+    # are dropped (drop-oldest); other types still block so we don't silently
+    # discard control or clipboard traffic.
+    message_queue_maxsize: int = 4096
+    # Log a warning at most once per N puts when the queue stays above this fill ratio.
+    queue_high_watermark: float = 0.8
 
 
 class MessageExchange:
@@ -100,8 +111,13 @@ class MessageExchange:
             str, Callable[[ProtocolMessage], Coroutine[Any, Any, None]]
         ] = {}
 
-        # Chunk reassembly buffer
-        self._chunk_buffer: Dict[str, list[Optional[ProtocolMessage]]] = {}
+        # Chunk reassembly buffer: message_id -> (chunks, monotonic_created_at)
+        # Stale entries are dropped after CHUNK_REASSEMBLY_TTL to avoid leaks when
+        # a sender drops mid-stream and never delivers the final chunk.
+        self._chunk_buffer: Dict[
+            str, tuple[list[Optional[ProtocolMessage]], float]
+        ] = {}
+        self._last_chunk_gc: float = 0.0
 
         # Transport layer callbacks
         # We support multiple transports for multicast scenarios
@@ -135,10 +151,63 @@ class MessageExchange:
             self._metrics = await self._metrics_collector.register_connection(self._id)
 
         self._running = True
-        self._message_queue: Queue[ProtocolMessage] = asyncio.Queue(maxsize=10000)
+        self._message_queue: Queue[ProtocolMessage] = asyncio.Queue(
+            maxsize=self.config.message_queue_maxsize
+        )
+        self._high_water = int(
+            self.config.message_queue_maxsize * self.config.queue_high_watermark
+        )
+        self._last_high_water_warn: float = 0.0
         self._receive_task = asyncio.create_task(self._receive_loop())
 
         self._logger.debug("Started")
+
+    # Message types that tolerate frame loss when the consumer falls behind.
+    # Anything else (clipboard, command, file, ...) keeps the blocking put().
+    _DROP_OLDEST_TYPES = frozenset({"mouse"})
+
+    async def _enqueue_message(self, message: "ProtocolMessage") -> None:
+        """
+        Bounded put with backpressure policy:
+        - lossy types (mouse) drop the oldest queued frame when full,
+          so the receive loop never stalls on a slow consumer;
+        - everything else awaits a slot.
+        Emits a rate-limited warning when the queue stays near capacity.
+        """
+        q = self._message_queue
+        if q is None:
+            return
+
+        if message.message_type in self._DROP_OLDEST_TYPES:
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                # Drop the oldest frame to make room and re-warn (rate-limited).
+                try:
+                    dropped = q.get_nowait()
+                    q.task_done()
+                    self._logger.warning(
+                        f"Exchange queue full ({q.maxsize}); dropped oldest "
+                        f"{getattr(dropped, 'message_type', '?')} frame"
+                    )
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(message)
+                except asyncio.QueueFull:
+                    pass
+        else:
+            await q.put(message)
+
+        # Periodic backpressure warning so high fill ratios are visible
+        # without spamming logs.
+        if q.qsize() >= self._high_water:
+            now = monotonic()
+            if now - self._last_high_water_warn > 5.0:
+                self._last_high_water_warn = now
+                self._logger.warning(
+                    f"Exchange queue high-water hit: {q.qsize()}/{q.maxsize}"
+                )
 
     async def stop(self):
         """Cleanup and shutdown the message exchange layer."""
@@ -198,9 +267,10 @@ class MessageExchange:
                     )
 
                     if msg_length > max_msg_size:
-                        self._logger.debug(
-                            f"Received message length {msg_length} exceeds maximum allowed {max_msg_size}. Skipping."
-                        )
+                        if self._logger.is_enabled_for(Logger.DEBUG):
+                            self._logger.debug(
+                                f"Received message length {msg_length} exceeds maximum allowed {max_msg_size}. Skipping."
+                            )
                         # Message too large, seek next marker
                         offset += 1
                         # await asyncio.sleep(0)
@@ -212,9 +282,10 @@ class MessageExchange:
                     if offset + total_length > buffer_len:
                         # Incomplete message, keep from offset onwards
                         # await asyncio.sleep(0)
-                        self._logger.debug(
-                            f"Incomplete message received. Expected length: {total_length}, current buffer length: {buffer_len - offset}. Waiting for more data."
-                        )
+                        if self._logger.is_enabled_for(Logger.DEBUG):
+                            self._logger.debug(
+                                f"Incomplete message received. Expected length: {total_length}, current buffer length: {buffer_len - offset}. Waiting for more data."
+                            )
                         break
 
                     # Extract and process the complete message
@@ -242,12 +313,12 @@ class MessageExchange:
                             if self.config.auto_dispatch:
                                 await self.dispatch_message(reconstructed)
                             elif self._message_queue:
-                                await self._message_queue.put(reconstructed)  # ty:ignore[possibly-missing-attribute]
+                                await self._enqueue_message(reconstructed)
                     else:
                         if self.config.auto_dispatch:
                             await self.dispatch_message(message)
                         elif self._message_queue:
-                            await self._message_queue.put(message)  # ty:ignore[possibly-missing-attribute]
+                            await self._enqueue_message(message)
 
                     offset += total_length
                     # print(f"Received message of type {message.message_type}, length {msg_length} bytes")
@@ -546,6 +617,12 @@ class MessageExchange:
         """
         # Cycle through all send callbacks
         callback_snapshot = list(self._send_callbacks.items())
+        # Guard against a silent drop
+        if not callback_snapshot:
+            raise MissingTransportError(
+                "Transport layer not configured (no send callbacks). "
+                "Call set_transport() first."
+            )
         for tr_id, send_callback in callback_snapshot:  # Round-robin
             if not send_callback:
                 raise MissingTransportError(
@@ -608,6 +685,24 @@ class MessageExchange:
         except (asyncio.TimeoutError, asyncio.QueueEmpty):
             return None
 
+    def _gc_stale_chunks(self, now: float) -> None:
+        if now - self._last_chunk_gc < CHUNK_GC_INTERVAL:
+            return
+        self._last_chunk_gc = now
+        stale = [
+            mid
+            for mid, (_chunks, created) in self._chunk_buffer.items()
+            if now - created > CHUNK_REASSEMBLY_TTL
+        ]
+        if not stale:
+            return
+        for mid in stale:
+            del self._chunk_buffer[mid]
+        self._logger.warning(
+            f"Dropped {len(stale)} stale chunk-reassembly buffer(s) "
+            f"older than {CHUNK_REASSEMBLY_TTL}s"
+        )
+
     async def _handle_chunk(self, chunk: ProtocolMessage) -> Optional[ProtocolMessage]:
         """
         Handle a chunked message and reassemble when complete.
@@ -617,20 +712,26 @@ class MessageExchange:
         """
         message_id = chunk.message_id
         if message_id is None:
-            self._logger.debug(
-                "Received chunk without message_id", data=chunk.to_dict()
-            )
+            if self._logger.is_enabled_for(Logger.DEBUG):
+                self._logger.debug(
+                    "Received chunk without message_id", data=chunk.to_dict()
+                )
             return None
 
-        if message_id not in self._chunk_buffer:
-            self._chunk_buffer[message_id] = [None] * chunk.total_chunks  # ty:ignore[unsupported-operator]
+        now = monotonic()
+        self._gc_stale_chunks(now)
 
-        self._chunk_buffer[message_id][chunk.chunk_index] = chunk  # ty:ignore[invalid-assignment]
+        entry = self._chunk_buffer.get(message_id)
+        if entry is None:
+            entry = ([None] * chunk.total_chunks, now)  # ty:ignore[unsupported-operator]
+            self._chunk_buffer[message_id] = entry
+        chunks_list = entry[0]
+        chunks_list[chunk.chunk_index] = chunk  # ty:ignore[invalid-assignment]
 
         # Check if all chunks received
-        if all(c is not None for c in self._chunk_buffer[message_id]):
-            chunks = self._chunk_buffer.pop(message_id)
-            return self.builder.reconstruct_from_chunks(chunks)
+        if all(c is not None for c in chunks_list):
+            del self._chunk_buffer[message_id]
+            return self.builder.reconstruct_from_chunks(chunks_list)
 
         return None
 

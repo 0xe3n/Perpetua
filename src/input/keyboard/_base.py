@@ -152,14 +152,14 @@ class ServerKeyboardListener(object):
         """
         Starts the keyboard listener.
         """
-        # Capture event loop reference if not already set
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                self._logger.warning(
-                    "No event loop running when starting keyboard listener. Async operations may fail."
-                )
+        # Always re-capture the running loop: a previous start() may have
+        # cached a loop that has since been closed (e.g. between tests).
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._logger.warning(
+                "No event loop running when starting keyboard listener. Async operations may fail."
+            )
 
         if not self.is_alive():
             self._listener = self._create_listener()
@@ -463,7 +463,7 @@ class ServerKeyboardListener(object):
 
     async def _hotkey_panic(self) -> None:
         """
-        Hotkey handler: panic button — sends SIGQUIT to the current process.
+        Hotkey handler: panic button - sends SIGQUIT to the current process.
         Combination: Ctrl+Shift+Q
         """
         self._logger.warning("Panic hotkey triggered: sending SIGTERM to self.")

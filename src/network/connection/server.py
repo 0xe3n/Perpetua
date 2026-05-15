@@ -33,6 +33,7 @@ from network.data.exchange import MessageExchange, MessageExchangeConfig
 from network.protocol.message import MessageType, ProtocolMessage
 from network.stream import StreamType
 from utils.logging import Logger, get_logger
+from utils.net import set_socket_nodelay
 
 from .handler import CallbackError, BaseConnectionHandler
 
@@ -58,6 +59,9 @@ class ConnectionHandler(BaseConnectionHandler):
 
     HANDSHAKE_DELAY = 0.2  # sec
     HANDSHAKE_MSG_TIMEOUT = 5.0  # sec
+    HANDSHAKE_EOF_POLL_INTERVAL = (
+        0.05  # sec, how often to check peer EOF during handshake
+    )
     CONNECTION_ATTEMPT_TIMEOUT = 10  # sec
     MAX_HEARTBEAT_MISSES = 0
 
@@ -277,6 +281,7 @@ class ConnectionHandler(BaseConnectionHandler):
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
         """Gestisce una nuova connessione client (handshake o stream aggiuntivo)"""
+        set_socket_nodelay(writer)
         addr = writer.get_extra_info("peername")
         self._logger.log(f"Accepted connection from {addr}", Logger.DEBUG)
 
@@ -298,12 +303,10 @@ class ConnectionHandler(BaseConnectionHandler):
 
             # TODO: Move client allowlist verification here and let user allow/block before handshake
 
-            # Handshake
+            # Handshake. _handshake() logs the specific failure reason
+            # (timeout, allowlist miss, uid/hostname mismatch, probe, ...);
+            # we only need to ensure the socket is cleaned up here.
             if not await self._handshake(reader, writer, addr[0], client_obj):
-                self._logger.log(
-                    f"Handshake failed for client {addr[0]}. Closing connection.",
-                    Logger.WARNING,
-                )
                 await self._clean_on_connection_lost(writer)
                 return
 
@@ -330,6 +333,68 @@ class ConnectionHandler(BaseConnectionHandler):
         against the list of known IP addresses.
         """
         return client_obj.has_ip(address)
+
+    async def _wait_for_handshake_response(
+        self,
+        msg_exchange: MessageExchange,
+        reader: asyncio.StreamReader,
+        timeout: float,
+    ) -> tuple[Optional[ProtocolMessage], bool]:
+        """
+        Wait for a handshake response while watching for peer EOF.
+
+        Races message reception against EOF detection on the reader. If the
+        peer closes the connection without responding (typical TCP probe used
+        by clients/health checks to verify reachability), this returns
+        ``(None, True)`` as soon as the close is observed, avoiding the full
+        handshake timeout.
+
+        Args:
+            msg_exchange: MessageExchange driving the handshake.
+            reader: Underlying ``StreamReader`` whose EOF state signals a probe.
+            timeout: Maximum time to wait, in seconds.
+
+        Returns:
+            ``(message, is_probe)`` where ``message`` is the received
+            :class:`ProtocolMessage` (or ``None`` if the peer closed), and
+            ``is_probe`` is True when EOF was reached before any message
+            arrived.
+
+        Raises:
+            asyncio.TimeoutError: If neither a message nor EOF is observed
+                within ``timeout`` seconds.
+        """
+        receive_task = asyncio.create_task(msg_exchange.get_received_message())
+
+        async def _wait_for_eof():
+            while not reader.at_eof():
+                await asyncio.sleep(self.HANDSHAKE_EOF_POLL_INTERVAL)
+
+        eof_task = asyncio.create_task(_wait_for_eof())
+
+        try:
+            done, _pending = await asyncio.wait(
+                {receive_task, eof_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (receive_task, eof_task):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        if not done:
+            raise asyncio.TimeoutError()
+
+        if receive_task in done and not receive_task.cancelled():
+            return receive_task.result(), False
+
+        # EOF observed before any handshake response: peer closed early.
+        return None, True
 
     async def _handshake(
         self,
@@ -372,15 +437,28 @@ class ConnectionHandler(BaseConnectionHandler):
             # Start receiving to process the response
             await client_msg_exchange.start()
 
-            # Wait for response with timeout
+            # Wait for response, watching for peer EOF to detect TCP probes
+            # (clients that open a connection just to test reachability and
+            # close immediately - e.g. service-side availability checks).
             try:
-                response = await asyncio.wait_for(
-                    client_msg_exchange.get_received_message(),
-                    timeout=self.HANDSHAKE_MSG_TIMEOUT,
+                response, is_probe = await self._wait_for_handshake_response(
+                    client_msg_exchange,
+                    reader,
+                    self.HANDSHAKE_MSG_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 self._logger.log(
                     f"Handshake timeout for client {client_addr}", Logger.WARNING
+                )
+                await client_msg_exchange.stop()
+                return False
+
+            if is_probe:
+                # Peer closed before responding: silently abort - this is a
+                # routine reachability probe, not a failed handshake.
+                self._logger.log(
+                    f"Probe connection from {client_addr} closed before handshake response",
+                    Logger.DEBUG,
                 )
                 await client_msg_exchange.stop()
                 return False
@@ -475,7 +553,7 @@ class ConnectionHandler(BaseConnectionHandler):
                         await cur_stream.close()
                         return False
                     else:
-                        # Client has no known IPs yet (hostname-only config) — register this IP
+                        # Client has no known IPs yet (hostname-only config) - register this IP
                         self._logger.log(
                             f"Registering new IP {client_addr} for client {client.get_net_id()}",
                             Logger.INFO,
@@ -488,7 +566,7 @@ class ConnectionHandler(BaseConnectionHandler):
                 # Normal flow: update client info
                 client.uid = response.payload.get("client_name", client.uid)
                 client.screen_resolution = response.payload.get(
-                    "screen_resolution", None
+                    "screen_resolution", "0x0"
                 )
                 client.additional_params = response.payload.get("additional_params", {})
                 client.ssl = response.payload.get("ssl", False)
@@ -637,6 +715,7 @@ class ConnectionHandler(BaseConnectionHandler):
                 )
 
                 stream_addr = stream_writer.get_extra_info("peername")
+                set_socket_nodelay(stream_writer)
 
                 # Wrap SSL
                 if client.ssl and self.certfile and self.keyfile:
@@ -644,6 +723,7 @@ class ConnectionHandler(BaseConnectionHandler):
                         stream_writer.start_tls(self._get_ssl_context()),
                         timeout=self.CONNECTION_ATTEMPT_TIMEOUT,
                     )
+                    set_socket_nodelay(stream_writer)
                     self._logger.log(
                         f"SSL stream connection for {stream_type} from {stream_addr}",
                         Logger.INFO,
@@ -783,18 +863,22 @@ class ConnectionHandler(BaseConnectionHandler):
 
                                 stream_reader = client_conn.get_reader(stream_type)
                                 stream_writer = client_conn.get_writer(stream_type)
-                                if (
+                                reader_closed = (
                                     stream_reader is None or stream_reader.is_closed()
-                                ) or (
+                                )
+                                writer_closed = (
                                     stream_writer is None
                                     or await stream_writer.is_closed()
-                                ):
+                                )
+                                if reader_closed or writer_closed:
                                     # Force closure of the stream writer if it exists
                                     if stream_writer:
                                         await stream_writer.close()
                                     closed_streams.append(stream_type)
-                                else:
-                                    # Send heartbeat
+                                elif stream_writer is not None:
+                                    # Send heartbeat (writer is guaranteed non-None
+                                    # here because reader_closed/writer_closed were
+                                    # both false).
                                     hb_msg = ProtocolMessage(
                                         message_type=MessageType.HEARTBEAT,
                                         source="server",
@@ -807,7 +891,8 @@ class ConnectionHandler(BaseConnectionHandler):
                                         await stream_writer.send(hb_msg.to_bytes())
                                     except Exception as e:
                                         self._logger.warning(
-                                            f"Heartbeat send failed on stream {stream_type} for client {client.get_net_id()} ({e})"
+                                            f"Heartbeat send failed on stream {stream_type} for client {client.get_net_id()} "
+                                            f"(exc_type={type(e).__name__}, exc={e!r})"
                                         )
                                         closed_streams.append(stream_type)
 
@@ -851,7 +936,9 @@ class ConnectionHandler(BaseConnectionHandler):
                             ):
                                 heartbeat_trials[client.get_net_id()] += 1
                                 self._logger.log(
-                                    f"Heartbeat missed for client {client.get_net_id()} (trial {heartbeat_trials[client.get_net_id()]}/{self.MAX_HEARTBEAT_MISSES})",
+                                    f"Heartbeat missed for client {client.get_net_id()} "
+                                    f"(trial {heartbeat_trials[client.get_net_id()]}/{self.MAX_HEARTBEAT_MISSES}, "
+                                    f"exc_type={type(e).__name__}, exc={e!r})",
                                     Logger.WARNING,
                                 )
                             else:
@@ -859,7 +946,8 @@ class ConnectionHandler(BaseConnectionHandler):
                                 heartbeat_trials[client.get_net_id()] = 0
                         except Exception as e:
                             self._logger.log(
-                                f"Heartbeat error for client {client.get_net_id()} ({e})",
+                                f"Heartbeat error for client {client.get_net_id()} "
+                                f"(exc_type={type(e).__name__}, exc={e!r})",
                                 Logger.CRITICAL,
                             )
         except asyncio.CancelledError:
@@ -876,12 +964,19 @@ class ConnectionHandler(BaseConnectionHandler):
     def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
         """
         Create SSL context if certfile and keyfile are provided.
+        Cached: certificate parsing happens once per (certfile, keyfile) pair.
         """
         if not self.certfile or not self.keyfile:
             return None
 
+        cache_key = (self.certfile, self.keyfile)
+        cached = getattr(self, "_ssl_context_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        self._ssl_context_cache = (cache_key, context)
         return context
 
     def _ssl_wrap(self, client_socket):

@@ -43,7 +43,7 @@ from enum import StrEnum
 from config import ApplicationConfig, ServerConfig, ClientConfig
 from service.client import Client
 from service.server import Server
-from utils import UIDGenerator
+from utils import UIDGenerator, BackgroundTasks
 from utils.logging import Logger, get_logger
 from utils.cli import DaemonArguments
 from utils.permissions import PermissionChecker
@@ -255,6 +255,9 @@ class Daemon:
 
     MAX_CONNECTIONS = 1  # Only accept one connection at a time
     BUFFER_SIZE = 16384  # 16KB
+    # Cap concurrent command executions: a buggy/abusive client could otherwise
+    # spam commands and accumulate fire-and-forget tasks without bound.
+    MAX_CONCURRENT_COMMANDS = 16
 
     _encoder = msgspec.json.Encoder()
     _decoder = msgspec.json.Decoder()
@@ -315,6 +318,11 @@ class Daemon:
 
         self._command_handlers: Dict[str, Callable] = CommandHandler.get_handlers(self)
 
+        # Strong refs for fire-and-forget tasks (command exec, notifications, etc.)
+        self._bg_tasks = BackgroundTasks()
+        # Limit concurrent command tasks regardless of how fast they arrive.
+        self._command_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_COMMANDS)
+
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
         self._shutdown_calls = 0
@@ -345,12 +353,17 @@ class Daemon:
             return
         self._logger.info("Permission watchdog started", interval=interval)
 
+        # Cap the OS-level check so a stuck system call can't hold the
+        # watchdog (or, indirectly via the default executor, the loop) hostage.
+        check_timeout = max(interval, 5.0)
+        max_retry = 3
         try:
             while self._running:
                 await asyncio.sleep(interval)
                 try:
-                    result = await loop.run_in_executor(
-                        None, checker.check_accessibility_live
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(None, checker.check_accessibility_live),
+                        timeout=check_timeout,
                     )
                     if result.is_denied:
                         self._logger.error(
@@ -359,6 +372,23 @@ class Daemon:
                         await self._notification_manager.notify_error(
                             error="Accessibility permission was revoked. "
                             "Shutting down to prevent input lock.",
+                            context="permission_watchdog",
+                        )
+                        await self.stop()
+                        return
+                except asyncio.TimeoutError:
+                    self._logger.warning(
+                        "Permission watchdog check timed out",
+                        timeout=check_timeout,
+                    )
+                    max_retry -= 1
+                    if max_retry <= 0:
+                        self._logger.error(
+                            "Permission watchdog check failed repeatedly, shutting down"
+                        )
+                        await self._notification_manager.notify_error(
+                            error="Permission watchdog check failed repeatedly. "
+                            "Shutting down to prevent potential input lock.",
                             context="permission_watchdog",
                         )
                         await self.stop()
@@ -694,6 +724,12 @@ class Daemon:
         if not IS_WINDOWS and os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
 
+        # Wait for any in-flight fire-and-forget tasks to finish (or cancel them).
+        try:
+            await asyncio.wait_for(self._bg_tasks.drain(), timeout=2.0)
+        except asyncio.TimeoutError:
+            await self._bg_tasks.drain(cancel=True)
+
         self._shutdown_event.set()
         self._logger.info("Daemon stopped")
 
@@ -791,11 +827,11 @@ class Daemon:
                         await asyncio.sleep(0.1)
                         continue
 
-                    commands_data, bytes_read = self.parse_msg_bytes(bytes(buff))
+                    commands_data, bytes_read = self.parse_msg_bytes(buff)
 
-                    # Clear read bytes from buffer
+                    # Clear read bytes in-place (no reallocation of the bytearray).
                     if bytes_read > 0:
-                        buff = buff[bytes_read:]
+                        del buff[:bytes_read]
 
                     for command_data in commands_data:
                         try:
@@ -809,7 +845,9 @@ class Daemon:
                             continue
 
                         # Execute command (no response needed, commands send notifications)
-                        asyncio.create_task(self._execute_command(command, params))
+                        self._bg_tasks.spawn(
+                            self._execute_command_throttled(command, params)
+                        )
                         await asyncio.sleep(0)
 
                 except asyncio.TimeoutError:
@@ -869,7 +907,7 @@ class Daemon:
         return message_bytes + length_prefix + b"\n"
 
     @staticmethod
-    def parse_msg_bytes(data: bytes) -> tuple[list[dict], int]:
+    def parse_msg_bytes(data: "bytes | bytearray") -> tuple[list[dict], int]:
         """
         Parses a byte sequence containing serialized messages with length prefixes and a delimiter.
 
@@ -962,7 +1000,7 @@ class Daemon:
         """
         # Services now send NotificationEvent objects directly
         # We forward them through the notification manager
-        asyncio.create_task(self._notification_manager.notify_event(event))
+        self._bg_tasks.spawn(self._notification_manager.notify_event(event))
 
     def is_client_connected(self) -> bool:
         """Check if a client is currently connected"""
@@ -1027,6 +1065,17 @@ class Daemon:
             return self._client, self._client_config, "client", None
         else:
             return None, None, "", f"Invalid service type: {service_type}"
+
+    async def _execute_command_throttled(
+        self, command: str, params: Dict[str, Any]
+    ) -> None:
+        """
+        Bounded variant of _execute_command: holds a semaphore slot while the
+        underlying handler runs so a flood of commands can't accumulate
+        unbounded fire-and-forget tasks.
+        """
+        async with self._command_semaphore:
+            await self._execute_command(command, params)
 
     async def _execute_command(self, command: str, params: Dict[str, Any]) -> None:
         """
@@ -2152,7 +2201,7 @@ class Daemon:
         )
 
         # Schedule shutdown after notification is sent
-        asyncio.create_task(self._delayed_shutdown())
+        self._bg_tasks.spawn(self._delayed_shutdown())
 
     async def _delayed_shutdown(self):
         """Delay shutdown to allow response to be sent"""
