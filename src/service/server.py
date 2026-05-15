@@ -31,9 +31,13 @@ from model.client import ClientObj, ClientsManager
 from event.bus import AsyncEventBus
 from event.notification import (
     NotificationEvent,
+    ClientApprovalRequestedEvent,
+    ClientApprovalResolvedEvent,
     ClientConnectedEvent as ClientConnectedNotification,
     ClientDisconnectedEvent as ClientDisconnectedNotification,
     ConfigSavedEvent,
+    OtpGeneratedEvent,
+    PairingRequestEvent,
     StreamEnabledEvent,
     StreamDisabledEvent,
 )
@@ -186,6 +190,14 @@ class Server:
             Callable[[NotificationEvent], Awaitable[None]]
         ] = None
 
+        # Pending client-approval requests: each unknown client that initiates
+        # a handshake spawns a Future stored here, resolved by the admin via
+        # approve_pending_client / deny_pending_client (or by timeout).
+        self._pending_approvals: Dict[str, "asyncio.Future[Optional[ClientObj]]"] = {}
+        self._pending_approval_meta: Dict[str, Dict[str, str]] = {}
+        self._pending_approvals_lock = asyncio.Lock()
+        self._approval_request_timeout = 60  # seconds
+
     @property
     def clients_manager(self) -> ClientsManager:
         """Access the ClientsManager from configuration"""
@@ -332,7 +344,88 @@ class Server:
             self._logger.error(f"Error setting up SSL certificates ({e})")
             raise
 
-    # TODO: Better handling -> We should keep the sharing server alive because port may be blocked
+    async def start_pairing_service(
+        self,
+        host: Optional[str] = None,
+        port: int = ServerConfig.DEFAULT_PORT - 2,
+    ) -> bool:
+        """
+        Start the always-on pairing/cert-sharing listener.
+
+        While this listener is running, clients can:
+
+        - send ``REQUEST_PAIRING`` to ask the server to auto-generate an OTP
+          and surface it on the admin GUI (no OTP travels over the network);
+        - send ``GET_CERTIFICATE`` to download the encrypted CA bundle once an
+          OTP is active.
+
+        Idempotent: if the service is already running, this is a no-op.
+        """
+        if not self._cert_manager.certificates_exist():
+            self._logger.warning(
+                "No certificates available, skipping pairing service start"
+            )
+            return False
+
+        if self._cert_sharing and self._cert_sharing.is_sharing_active():
+            # Refresh the callback so it captures the current notification
+            # callback even if it changed since last start.
+            self._cert_sharing.set_pairing_request_callback(self._on_pairing_requested)
+            return True
+
+        cert_data = self._cert_manager.load_ca_data()
+        if not cert_data:
+            self._logger.error("Failed to load CA certificate data")
+            return False
+
+        bind_host = host if host is not None else "0.0.0.0"
+        self._cert_sharing = CertificateSharing(
+            cert_data=cert_data,
+            host=bind_host,
+            port=port,
+            timeout=30,
+            pairing_request_callback=self._on_pairing_requested,
+        )
+
+        ok = await self._cert_sharing.start_service()
+        if not ok:
+            self._logger.error("Failed to start pairing service")
+            self._cert_sharing = None
+        return ok
+
+    async def _on_pairing_requested(self, info: Dict[str, str]) -> None:
+        """Bridge a pairing request from CertificateSharing into notifications.
+
+        Emits two events so the GUI can react with either:
+        - the legacy ``OtpGenerated`` path (existing UI just works);
+        - the richer ``PairingRequested`` path (shows which client asked).
+        """
+        try:
+            otp = info.get("otp", "")
+            timeout_val = int(info.get("timeout", "0") or 0)
+            peer_ip = info.get("peer_ip", "")
+            hostname = info.get("hostname", "")
+            was_active = info.get("was_active", "0") == "1"
+        except Exception as e:
+            self._logger.error(f"Malformed pairing info payload: {e}")
+            return
+
+        await self._send_notification(
+            PairingRequestEvent(
+                otp=otp,
+                timeout=timeout_val,
+                peer_ip=peer_ip,
+                hostname=hostname,
+                was_active=was_active,
+            )
+        )
+        # Mirror as OtpGenerated so existing GUI listeners keep working
+        # without needing to know about pairing-vs-manual provenance.
+        if otp:
+            await self._send_notification(
+                OtpGeneratedEvent(otp=otp, timeout=timeout_val)
+            )
+
     async def share_certificate(
         self,
         host: str = "0.0.0.0",
@@ -340,15 +433,16 @@ class Server:
         timeout: int = 30,
     ) -> Tuple[bool, Optional[str]]:
         """
-        Start certificate sharing process with OTP.
+        Start (or refresh) certificate sharing with an OTP.
 
-        Opens a temporary server that clients can connect to receive the CA certificate.
-        Returns an OTP that must be used by the client to decrypt the certificate.
+        If the always-on pairing service is running, this just ensures an OTP
+        is active and returns it — no new socket is opened. Otherwise it falls
+        back to the legacy one-shot flow that opens a temporary server.
 
         Args:
             host: Host address for temporary server (default: all interfaces)
             port: Port for temporary server (default: 55556)
-            timeout: Maximum time window in seconds (default: 30)
+            timeout: OTP validity window in seconds (default: 30)
 
         Returns:
             Tuple of (success, otp). OTP is None if failed.
@@ -363,21 +457,29 @@ class Server:
             self._logger.error("No certificates available to share")
             return False, None
 
-        # Stop previous sharing if active
+        # Fast path: pairing service already up — just refresh the OTP.
         if self._cert_sharing and self._cert_sharing.is_sharing_active():
-            await self._cert_sharing.stop_sharing()
+            otp, remaining = await self._cert_sharing.ensure_active_otp(timeout=timeout)
+            if otp:
+                self._logger.info(
+                    f"Refreshed OTP via pairing service (valid {remaining}s)"
+                )
+                return True, otp
+            return False, None
 
         try:
-            # Get CA certificate
             cert_data = self._cert_manager.load_ca_data()
 
             if not cert_data:
                 self._logger.error("Failed to load CA certificate data")
                 return False, None
 
-            # Create and start sharing
             self._cert_sharing = CertificateSharing(
-                cert_data=cert_data, host=host, port=port, timeout=timeout
+                cert_data=cert_data,
+                host=host,
+                port=port,
+                timeout=timeout,
+                pairing_request_callback=self._on_pairing_requested,
             )
 
             success, otp = await self._cert_sharing.start_sharing()
@@ -693,6 +795,146 @@ class Server:
             self._logger.error(f"Failed to disable {stream_type} stream ({e})")
             raise RuntimeError(f"Failed to disable {stream_type} stream ({e})")
 
+    # ==================== Client Approval (interactive) ====================
+
+    async def _request_client_approval(
+        self, peer_ip: str, hostname: str, uid: str
+    ) -> Optional[ClientObj]:
+        """Ask the admin (via GUI) whether to accept an unknown client.
+
+        Called by the ConnectionHandler when a client not present in the
+        allowlist completes the handshake. Emits a notification with the
+        client's identifiers, then blocks on a Future that the admin resolves
+        via :meth:`approve_pending_client` or :meth:`deny_pending_client`.
+
+        Returns:
+            A populated ClientObj if approved (already added to the
+            allowlist), or None if denied / timed out.
+        """
+        request_id = f"{peer_ip}-{int(asyncio.get_running_loop().time() * 1000)}"
+
+        async with self._pending_approvals_lock:
+            existing = self._pending_approvals.get(peer_ip)
+            if existing is not None and not existing.done():
+                # A second handshake attempt from the same IP while an admin
+                # decision is pending: piggy-back on the same Future instead
+                # of stacking prompts.
+                self._logger.info(
+                    f"Reusing pending approval for {peer_ip} (hostname={hostname})"
+                )
+                fut = existing
+            else:
+                fut = asyncio.get_running_loop().create_future()
+                self._pending_approvals[peer_ip] = fut
+                self._pending_approval_meta[peer_ip] = {
+                    "hostname": hostname,
+                    "uid": uid,
+                    "request_id": request_id,
+                }
+
+        if existing is None or existing.done():
+            await self._send_notification(
+                ClientApprovalRequestedEvent(
+                    peer_ip=peer_ip,
+                    hostname=hostname,
+                    uid=uid,
+                    request_id=request_id,
+                    timeout=self._approval_request_timeout,
+                )
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(fut), timeout=self._approval_request_timeout
+            )
+            return result
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                f"Approval request for {peer_ip} timed out — denying by default"
+            )
+            await self._resolve_pending_approval(peer_ip, None, reason="timeout")
+            return None
+        finally:
+            async with self._pending_approvals_lock:
+                # Clean up only if this Future is still the one we stored.
+                if self._pending_approvals.get(peer_ip) is fut:
+                    self._pending_approvals.pop(peer_ip, None)
+                    self._pending_approval_meta.pop(peer_ip, None)
+
+    async def _resolve_pending_approval(
+        self,
+        peer_ip: str,
+        client: Optional[ClientObj],
+        screen_position: str = "",
+        reason: str = "",
+    ) -> bool:
+        """Resolve a pending approval Future. Returns True if a Future existed."""
+        async with self._pending_approvals_lock:
+            fut = self._pending_approvals.get(peer_ip)
+            meta = self._pending_approval_meta.get(peer_ip, {})
+        if fut is None or fut.done():
+            return False
+        fut.set_result(client)
+        await self._send_notification(
+            ClientApprovalResolvedEvent(
+                peer_ip=peer_ip,
+                approved=client is not None,
+                request_id=meta.get("request_id", ""),
+                screen_position=screen_position,
+                reason=reason,
+            )
+        )
+        return True
+
+    async def approve_pending_client(
+        self, peer_ip: str, screen_position: str = "top"
+    ) -> bool:
+        """Approve an unknown client that's waiting for the admin's OK.
+
+        Adds the client to the persistent allowlist with the chosen screen
+        position before unblocking the handshake.
+        """
+        async with self._pending_approvals_lock:
+            meta = self._pending_approval_meta.get(peer_ip)
+            fut = self._pending_approvals.get(peer_ip)
+        if fut is None or fut.done():
+            self._logger.warning(
+                f"No pending approval for {peer_ip} (or already resolved)"
+            )
+            return False
+
+        hostname = (meta or {}).get("hostname") or None
+        try:
+            client = await self.add_client(
+                ip_addresses=peer_ip,
+                hostname=hostname,
+                screen_position=screen_position,
+                auto_save=True,
+            )
+        except Exception as e:
+            self._logger.error(f"Failed to add approved client {peer_ip} ({e})")
+            await self._resolve_pending_approval(
+                peer_ip, None, reason=f"add_failed: {e}"
+            )
+            return False
+
+        await self._resolve_pending_approval(
+            peer_ip, client, screen_position=screen_position, reason="approved"
+        )
+        return True
+
+    async def deny_pending_client(self, peer_ip: str, reason: str = "denied") -> bool:
+        """Deny an unknown client awaiting approval."""
+        return await self._resolve_pending_approval(peer_ip, None, reason=reason)
+
+    def get_pending_approvals(self) -> list[Dict[str, str]]:
+        """Snapshot of currently pending approvals (for status queries)."""
+        return [
+            {"peer_ip": ip, **(self._pending_approval_meta.get(ip, {}))}
+            for ip, fut in self._pending_approvals.items()
+            if not fut.done()
+        ]
+
     # ==================== Server Lifecycle ====================
 
     async def start(self) -> bool:
@@ -723,6 +965,7 @@ class Server:
             allowlist=self.clients_manager,
             certfile=self.certfile,
             keyfile=self.keyfile,
+            approval_callback=self._request_client_approval,
         )
 
         # Start mDNS service
@@ -763,6 +1006,16 @@ class Server:
             await self.stop(True)
             return False
 
+        # Bring up the pairing/cert-sharing listener so clients can request an
+        # OTP without the admin having to push a button first. Failure is
+        # non-fatal: the rest of the server keeps running, the admin can still
+        # share certs manually via share_certificate().
+        if self.config.ssl_enabled:
+            try:
+                await self.start_pairing_service(host=self.config.host)
+            except Exception as e:
+                self._logger.warning(f"Pairing service did not start ({e})")
+
         self._running = True
         self._logger.info(f"Server started on {self.config.host}:{self.config.port}")
         return True
@@ -777,9 +1030,25 @@ class Server:
 
         tasks: list[asyncio.Task] = []
 
+        # Cancel any pending client-approval prompts so admin GUI stops
+        # showing them and the futures don't leak.
+        for ip, fut in list(self._pending_approvals.items()):
+            if not fut.done():
+                fut.set_result(None)
+            self._pending_approvals.pop(ip, None)
+            self._pending_approval_meta.pop(ip, None)
+
         # Stop connection handler
         if self.connection_handler:
             await self.connection_handler.stop()
+
+        # Stop pairing/cert-sharing listener
+        if self._cert_sharing:
+            try:
+                await self._cert_sharing.stop_sharing()
+            except Exception as e:
+                self._logger.warning(f"Error stopping pairing service ({e})")
+            self._cert_sharing = None
 
         # Stop all components
         for component_name, component in list(self._components.items()):

@@ -59,6 +59,7 @@ export enum EventType {
     OtpValidated,
     OtpInvalid,
     OtpGenerated,
+    PairingRequested,
     SslHandshakeStarted,
     SslHandshakeCompleted,
     SslHandshakeFailed,
@@ -76,6 +77,8 @@ export enum EventType {
     ClientAdded,
     ClientRemoved,
     ClientUpdated,
+    ClientApprovalRequested,
+    ClientApprovalResolved,
 
     // Stream events
     StreamEnabled,
@@ -158,6 +161,9 @@ export enum CommandType {
     RemoveClient,
     EditClient,
     ListClients,
+    ApproveClient,
+    DenyClient,
+    ListPendingApprovals,
 
     // SSL/Certificate management
     EnableSsl,
@@ -165,6 +171,7 @@ export enum CommandType {
     ShareCertificate,
     ReceiveCertificate,
     SetOtp,
+    RequestPairing,
 
     // Server selection (client)
     CheckServerChoiceNeeded,
@@ -250,6 +257,30 @@ export interface OtpInfo {
     otp: string;
     timeout: number; // in seconds
     instructions: string;
+}
+
+export interface PairingRequestInfo {
+    otp: string;
+    timeout: number;
+    peer_ip: string;
+    hostname: string;
+    was_active: boolean;
+}
+
+export interface ClientApprovalRequest {
+    peer_ip: string;
+    hostname: string;
+    uid: string;
+    request_id: string;
+    timeout: number;
+}
+
+export interface ClientApprovalResolved {
+    peer_ip: string;
+    approved: boolean;
+    request_id: string;
+    screen_position: string;
+    reason: string;
 }
 
 

@@ -43,6 +43,17 @@ export function removeClient(hostname: string, ip_address: string): Promise<void
     return invoke(getType(CommandType, CommandType.RemoveClient), {hostname, ipAddress: ip_address});
 }
 
+export function approveClient(peer_ip: string, screen_position: string): Promise<void> {
+    return invoke(getType(CommandType, CommandType.ApproveClient), {
+        peerIp: peer_ip,
+        screenPosition: screen_position,
+    });
+}
+
+export function denyClient(peer_ip: string): Promise<void> {
+    return invoke(getType(CommandType, CommandType.DenyClient), {peerIp: peer_ip});
+}
+
 export function saveServerConfig(host: string, port: number, sslEnabled: boolean): Promise<void> {
     return invoke(getType(CommandType, CommandType.SetServerConfig), {host, port, sslEnabled});
 }
@@ -63,6 +74,10 @@ export function stopClient(): Promise<void> {
 
 export function setOtp(otp: string): Promise<void> {
     return invoke(getType(CommandType, CommandType.SetOtp), {otp});
+}
+
+export function requestPairing(): Promise<void> {
+    return invoke(getType(CommandType, CommandType.RequestPairing));
 }
 
 export function chooseServer(uid: string): Promise<void> {

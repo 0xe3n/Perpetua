@@ -30,11 +30,14 @@ import {AnimatePresence, motion} from 'motion/react';
 import {InlineNotification, Notification} from './ui/inline-notification';
 import {PowerButton} from './ui/power-button';
 import {PermissionsPanel} from './ui/permissions-panel';
+import {PendingApprovalCard} from './ui/pending-approval-card';
 
 import {useEventListeners} from '../hooks/useEventListeners';
 import {useClientManagement} from '../hooks/useClientManagement';
 import {
     addClient as addClientCommand,
+    approveClient as approveClientCommand,
+    denyClient as denyClientCommand,
     getLocalIpAddress,
     removeClient as removeClientCommand,
     saveServerConfig,
@@ -44,7 +47,18 @@ import {
     switchTrayIcon
 } from '../api/Sender';
 import {listenCommand, listenGeneralEvent} from '../api/Listener';
-import {ClientEditObj, ClientObj, CommandType, EventType, OtpInfo, ServerStatus, StreamType} from '../api/Interface';
+import {
+    ClientApprovalRequest,
+    ClientApprovalResolved,
+    ClientEditObj,
+    ClientObj,
+    CommandType,
+    EventType,
+    OtpInfo,
+    PairingRequestInfo,
+    ServerStatus,
+    StreamType
+} from '../api/Interface';
 
 import {ServerTabProps} from '../commons/Tab'
 import {isValidIpAddress, parseStreams} from '../api/Utility'
@@ -70,6 +84,13 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
     const [otp, setOtp] = useState('');
     const [otpRequested, setOtpRequested] = useState(false);
     const [otpTimeout, setOtpTimeout] = useState(30);
+    const [otpExpiresAt, setOtpExpiresAt] = useState<number | null>(null);
+    const [otpRemaining, setOtpRemaining] = useState(0);
+    const [pairingRequester, setPairingRequester] = useState('');
+    // Pending client-approval prompts: unknown clients trying to connect that
+    // the admin must allow/deny. Keyed by peer_ip so duplicate handshakes
+    // collapse onto the same prompt.
+    const [pendingApprovals, setPendingApprovals] = useState<ClientApprovalRequest[]>([]);
     const [firstInit, setFirstInit] = useState(true);
     const [clientIpTags, setClientIpTags] = useState<string[]>([]);
     const [clientIpInput, setClientIpInput] = useState('');
@@ -129,6 +150,49 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
         setShowOptions(!showOptions);
         setShowClients(false);
         setShowSecurity(false);
+    };
+
+    // Live countdown for the displayed OTP. Drives the "Expires in Xs" label
+    // shown on the inline OTP card under the power button.
+    useEffect(() => {
+        if (!otp || otpExpiresAt === null) {
+            setOtpRemaining(0);
+            return;
+        }
+        const tick = () => {
+            const remaining = Math.max(
+                0,
+                Math.ceil((otpExpiresAt - Date.now()) / 1000)
+            );
+            setOtpRemaining(remaining);
+        };
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+    }, [otp, otpExpiresAt]);
+
+    // Single source of truth for OTP expiration: whoever sets otpExpiresAt
+    // triggers exactly one expiry — no race between the pairing path and the
+    // manual share path, no double-fire under React StrictMode.
+    useEffect(() => {
+        if (!otp || otpExpiresAt === null) return;
+        const delay = otpExpiresAt - Date.now();
+        if (delay <= 0) return;
+        const id = setTimeout(() => {
+            setOtp('');
+            setOtpExpiresAt(null);
+            setPairingRequester('');
+            addNotification('info', 'OTP Expired');
+        }, delay);
+        return () => clearTimeout(id);
+    }, [otp, otpExpiresAt]);
+
+    const dismissOtp = () => {
+        setOtp('');
+        setOtpExpiresAt(null);
+        setOtpRemaining(0);
+        setPairingRequester('');
+        setOtpRequested(false);
     };
 
     useEffect(() => {
@@ -212,14 +276,111 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
             }).then(unlisten => {
                 listeners.addListenerOnce('client-disconnected', unlisten);
             });
+
+            // A client asked us to auto-generate an OTP. Surface it the same
+            // way as a manual share: populate the OTP field and toast.
+            listenGeneralEvent(EventType.PairingRequested, false, (event) => {
+                const info = event.data as PairingRequestInfo | undefined;
+                if (!info || !info.otp) return;
+                handlePairingRequest(info);
+            }).then(unlisten => {
+                listeners.addListenerOnce('pairing-requested', unlisten);
+            });
+
+            // An unknown client is trying to connect — server is holding the
+            // handshake open until we allow or deny via the inline card.
+            listenGeneralEvent(EventType.ClientApprovalRequested, false, (event) => {
+                const info = event.data as ClientApprovalRequest | undefined;
+                if (!info || !info.peer_ip) return;
+                handleApprovalRequest(info);
+            }).then(unlisten => {
+                listeners.addListenerOnce('approval-requested', unlisten);
+            });
+
+            // Server signalled the approval is resolved (timeout, second
+            // window, etc.). Drop the inline card if it's still up.
+            listenGeneralEvent(EventType.ClientApprovalResolved, false, (event) => {
+                const info = event.data as ClientApprovalResolved | undefined;
+                if (!info || !info.peer_ip) return;
+                handleApprovalResolved(info);
+            }).then(unlisten => {
+                listeners.addListenerOnce('approval-resolved', unlisten);
+            });
         };
 
         const cleanup = () => {
             listeners.removeListener('client-connected');
             listeners.removeListener('client-disconnected');
+            listeners.removeListener('pairing-requested');
+            listeners.removeListener('approval-requested');
+            listeners.removeListener('approval-resolved');
         };
 
         return {cleanup, setup};
+    };
+
+    const handleApprovalRequest = (info: ClientApprovalRequest) => {
+        setPendingApprovals((prev) => {
+            // Collapse repeated requests from the same IP onto the latest
+            // request_id so the card always reflects the most recent attempt.
+            const filtered = prev.filter((r) => r.peer_ip !== info.peer_ip);
+            return [...filtered, info];
+        });
+        const who = info.hostname || info.peer_ip;
+        addNotification(
+            'info',
+            'New client wants to connect',
+            `${who} is waiting for approval`
+        );
+    };
+
+    const handleApprovalResolved = (info: ClientApprovalResolved) => {
+        setPendingApprovals((prev) =>
+            prev.filter((r) => r.peer_ip !== info.peer_ip)
+        );
+    };
+
+    const handleApproveClient = (req: ClientApprovalRequest, position: string) => {
+        // Optimistically remove the card; the resolved-event will also remove
+        // it but we want immediate UI feedback.
+        setPendingApprovals((prev) =>
+            prev.filter((r) => r.peer_ip !== req.peer_ip)
+        );
+        approveClientCommand(req.peer_ip, position).catch((err) => {
+            console.error('Error approving client:', err);
+            addNotification('error', 'Failed to approve client');
+            // Restore the card so the admin can retry.
+            setPendingApprovals((prev) =>
+                prev.some((r) => r.peer_ip === req.peer_ip) ? prev : [...prev, req]
+            );
+        });
+    };
+
+    const handleDenyClient = (req: ClientApprovalRequest) => {
+        setPendingApprovals((prev) =>
+            prev.filter((r) => r.peer_ip !== req.peer_ip)
+        );
+        denyClientCommand(req.peer_ip).catch((err) => {
+            console.error('Error denying client:', err);
+            addNotification('error', 'Failed to deny client');
+        });
+    };
+
+    const handlePairingRequest = (info: PairingRequestInfo) => {
+        // If we already have an OTP displayed (manual share in progress) and
+        // the server reports the OTP was already active, the daemon just
+        // mirrored the same code — don't bounce the UI.
+        if (otp !== '' && info.was_active) return;
+
+        const who = info.hostname || info.peer_ip || 'a client';
+        setOtp(info.otp);
+        setPairingRequester(who);
+        setOtpExpiresAt(
+            info.timeout && info.timeout > 0
+                ? Date.now() + info.timeout * 1000
+                : null
+        );
+        setOtpRequested(false);
     };
 
     const handleToggleServer = () => {
@@ -288,7 +449,7 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
                 setIsRunning(false);
                 clientManager.disconnectAll();
                 setUptime(0);
-                setOtp('');
+                dismissOtp();
                 addNotification('warning', 'Server stopped');
                 onStatusChange(false);
                 setRunningPending(false);
@@ -318,17 +479,12 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
             let result = event.data?.result as OtpInfo;
             if (result && result.otp) {
                 setOtp(result.otp);
-                addNotification('success', 'OTP Generated', `Code: ${result.otp}`);
-                if (result.timeout && result.timeout > 0) {
-                    setTimeout(() => {
-                        setOtp('');
-                        addNotification('info', 'OTP Expired');
-                    }, result.timeout * 1000);
-                }
-
-                setTimeout(() => {
-                    otpFocus.current?.scrollIntoView({behavior: 'smooth'});
-                }, 5);
+                setPairingRequester('');
+                setOtpExpiresAt(
+                    result.timeout && result.timeout > 0
+                        ? Date.now() + result.timeout * 1000
+                        : null
+                );
             } else {
                 addNotification('error', 'Failed to generate OTP');
             }
@@ -342,8 +498,7 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
         shareCertificate(otpTimeout).catch((err) => {
             console.error('Error sharing certificate:', err);
             addNotification('error', 'Failed to share certificate');
-            setOtp('');
-            setOtpRequested(false);
+            dismissOtp();
         });
         setOtpRequested(true);
     };
@@ -568,6 +723,119 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
                 runningLabel="Server Running"
                 uid={isRunning ? uid : undefined}
             />
+
+            {/* OTP Display Panel - mirrors the client-side OtpInputPanel
+                location. Shows the OTP prominently right under the power
+                button whenever one is active, regardless of whether it came
+                from a manual "Share Certificate" or an auto pairing request. */}
+            <AnimatePresence>
+                {otp && (
+                    <motion.div
+                        ref={otpFocus}
+                        initial={{opacity: 0, y: -20, scale: 0.95}}
+                        animate={{opacity: 1, y: 0, scale: 1}}
+                        exit={{opacity: 0, y: -20, scale: 0.95}}
+                        transition={{duration: 0.3, ease: 'easeOut'}}
+                        className="p-5 rounded-xl border-2 backdrop-blur-sm"
+                        style={{
+                            backgroundColor: 'var(--app-card-bg)',
+                            borderColor: 'var(--app-primary)',
+                            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12)',
+                        }}
+                    >
+                        <div className="flex items-center gap-3 mb-3">
+                            <motion.div
+                                animate={{scale: [1, 1.1, 1]}}
+                                transition={{
+                                    duration: 2,
+                                    repeat: Infinity,
+                                    ease: 'easeInOut',
+                                }}
+                                className="w-12 h-12 rounded-lg flex items-center justify-center"
+                                style={{backgroundColor: 'var(--app-primary)'}}
+                            >
+                                <Key size={24} style={{color: 'white'}}/>
+                            </motion.div>
+                            <div className="flex-1">
+                                <h3 className="text-base font-bold"
+                                    style={{color: 'var(--app-text-primary)'}}
+                                >
+                                    {pairingRequester
+                                        ? `Pairing request from ${pairingRequester}`
+                                        : 'Share Certificate'}
+                                </h3>
+                                <p className="text-xs mt-1"
+                                   style={{color: 'var(--app-text-muted)'}}
+                                >
+                                    {pairingRequester
+                                        ? 'Share this code with the client'
+                                        : 'Provide this code to clients'}
+                                </p>
+                            </div>
+                            <motion.button
+                                whileHover={{scale: 1.1}}
+                                whileTap={{scale: 0.95}}
+                                onClick={dismissOtp}
+                                className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer"
+                                style={{
+                                    backgroundColor: 'var(--app-bg-secondary)',
+                                    color: 'var(--app-text-muted)',
+                                }}
+                                aria-label="Dismiss OTP"
+                            >
+                                <X size={16}/>
+                            </motion.button>
+                        </div>
+
+                        <div
+                            className="text-center p-4 rounded-lg border"
+                            style={{
+                                backgroundColor: 'var(--app-input-bg)',
+                                borderColor: 'var(--app-primary)',
+                            }}
+                        >
+                            <p
+                                className="text-3xl font-bold tracking-widest select-all cursor-pointer"
+                                style={{color: 'var(--app-primary-light)'}}
+                                onClick={() => {
+                                    navigator.clipboard?.writeText(otp).then(
+                                        () => addNotification('info', 'OTP copied'),
+                                        () => {}
+                                    );
+                                }}
+                                title="Click to copy"
+                            >
+                                {otp}
+                            </p>
+                            <p className="text-sm mt-2"
+                               style={{color: 'var(--app-text-muted)'}}
+                            >
+                                {otpRemaining > 0
+                                    ? `Expires in ${otpRemaining}s`
+                                    : otpExpiresAt
+                                        ? 'Expired'
+                                        : `Valid for ${otpTimeout}s`}
+                            </p>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Pending client-approval prompts. One card per unknown client
+                attempting to connect; the admin chooses screen position and
+                clicks Allow, or denies. The handshake on the server is held
+                open until one of the buttons is pressed (or the request
+                times out, in which case the resolved event removes the card). */}
+            <AnimatePresence>
+                {pendingApprovals.map((req) => (
+                    <PendingApprovalCard
+                        key={`${req.peer_ip}-${req.request_id}`}
+                        request={req}
+                        onApprove={(position) => handleApproveClient(req, position)}
+                        onDeny={() => handleDenyClient(req)}
+                    />
+                ))}
+            </AnimatePresence>
 
             {/* Inline Notifications */}
             <InlineNotification notifications={notifications}/>
@@ -967,25 +1235,6 @@ export function ServerTab({onStatusChange, state}: ServerTabProps) {
                                             Generate
                                         </motion.button>
                                     </div>
-                                    {otp && (
-                                        <motion.div
-                                            ref={otpFocus}
-                                            initial={{opacity: 0}}
-                                            animate={{opacity: 1}}
-                                            className="text-center p-4 rounded-lg border"
-                                            style={{
-                                                backgroundColor: 'var(--app-input-bg)',
-                                                borderColor: 'var(--app-primary)'
-                                            }}
-                                        >
-                                            <p className="text-3xl font-bold tracking-wider"
-                                               style={{color: 'var(--app-primary-light)'}}
-                                            >{otp}</p>
-                                            <p className="text-sm mt-2"
-                                               style={{color: 'var(--app-text-muted)'}}
-                                            >Expires in {otpTimeout}s</p>
-                                        </motion.div>
-                                    )}
                                 </motion.div>
                             )}
                         </div>

@@ -62,6 +62,7 @@ pub enum EventType {
     OtpValidated,
     OtpInvalid,
     OtpGenerated,
+    PairingRequested,
     SslHandshakeStarted,
     SslHandshakeCompleted,
     SslHandshakeFailed,
@@ -79,6 +80,8 @@ pub enum EventType {
     ClientAdded,
     ClientRemoved,
     ClientUpdated,
+    ClientApprovalRequested,
+    ClientApprovalResolved,
 
     // Stream events
     StreamEnabled,
@@ -179,6 +182,9 @@ pub enum CommandType {
     RemoveClient,
     EditClient,
     ListClients,
+    ApproveClient,
+    DenyClient,
+    ListPendingApprovals,
 
     // SSL/Certificate management
     EnableSsl,
@@ -186,6 +192,7 @@ pub enum CommandType {
     ShareCertificate,
     ReceiveCertificate,
     SetOtp,
+    RequestPairing,
 
     // Server selection (client)
     CheckServerChoiceNeeded,

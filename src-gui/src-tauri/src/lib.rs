@@ -388,12 +388,15 @@ pub fn run(daemon_config: Option<DaemonConfig>) {
             commands::stop_server,
             commands::share_certificate,
             commands::add_client,
+            commands::approve_client,
+            commands::deny_client,
             commands::remove_client,
             commands::set_server_config,
             // -- Client Commands --
             commands::start_client,
             commands::stop_client,
             commands::set_otp,
+            commands::request_pairing,
             commands::choose_server,
             commands::set_client_config,
             // -- General Commands --

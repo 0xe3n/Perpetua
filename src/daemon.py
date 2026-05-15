@@ -111,6 +111,9 @@ class DaemonCommand(StrEnum):
     REMOVE_CLIENT = "remove_client"
     EDIT_CLIENT = "edit_client"
     LIST_CLIENTS = "list_clients"
+    APPROVE_CLIENT = "approve_client"
+    DENY_CLIENT = "deny_client"
+    LIST_PENDING_APPROVALS = "list_pending_approvals"
 
     # SSL/Certificate management
     ENABLE_SSL = "enable_ssl"
@@ -118,6 +121,7 @@ class DaemonCommand(StrEnum):
     SHARE_CERTIFICATE = "share_certificate"
     RECEIVE_CERTIFICATE = "receive_certificate"
     SET_OTP = "set_otp"
+    REQUEST_PAIRING = "request_pairing"
 
     # Server selection (client)
     CHECK_SERVER_CHOICE_NEEDED = "check_server_choice_needed"
@@ -1764,6 +1768,101 @@ class Daemon:
         except Exception as e:
             await self._notification_manager.notify_command_error(command, f"{str(e)}")
 
+    @CommandHandler.register(DaemonCommand.APPROVE_CLIENT)
+    async def _handle_approve_client(self, params: Dict[str, Any]) -> None:
+        """Approve a pending client (server only)."""
+        command = DaemonCommand.APPROVE_CLIENT.value
+
+        if not self._server:
+            await self._notification_manager.notify_command_error(
+                command, "Server is not running"
+            )
+            return
+
+        try:
+            peer_ip = params.get("peer_ip") or params.get("ip_address")
+            screen_position = params.get("screen_position", "top")
+            if not peer_ip:
+                await self._notification_manager.notify_command_error(
+                    command, "Must provide peer_ip"
+                )
+                return
+
+            ok = await self._server.approve_pending_client(
+                peer_ip=peer_ip, screen_position=screen_position
+            )
+            if ok:
+                await self._notification_manager.notify_command_success(
+                    command,
+                    f"Client {peer_ip} approved at {screen_position}",
+                    result_data={
+                        "peer_ip": peer_ip,
+                        "screen_position": screen_position,
+                    },
+                )
+            else:
+                await self._notification_manager.notify_command_error(
+                    command,
+                    f"No pending approval for {peer_ip} (already resolved or timed out)",
+                )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
+    @CommandHandler.register(DaemonCommand.DENY_CLIENT)
+    async def _handle_deny_client(self, params: Dict[str, Any]) -> None:
+        """Deny a pending client (server only)."""
+        command = DaemonCommand.DENY_CLIENT.value
+
+        if not self._server:
+            await self._notification_manager.notify_command_error(
+                command, "Server is not running"
+            )
+            return
+
+        try:
+            peer_ip = params.get("peer_ip") or params.get("ip_address")
+            if not peer_ip:
+                await self._notification_manager.notify_command_error(
+                    command, "Must provide peer_ip"
+                )
+                return
+
+            ok = await self._server.deny_pending_client(peer_ip=peer_ip)
+            if ok:
+                await self._notification_manager.notify_command_success(
+                    command,
+                    f"Client {peer_ip} denied",
+                    result_data={"peer_ip": peer_ip},
+                )
+            else:
+                await self._notification_manager.notify_command_error(
+                    command,
+                    f"No pending approval for {peer_ip}",
+                )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
+    @CommandHandler.register(DaemonCommand.LIST_PENDING_APPROVALS)
+    async def _handle_list_pending_approvals(self, params: Dict[str, Any]) -> None:
+        """List currently pending client-approval requests (server only)."""
+        command = DaemonCommand.LIST_PENDING_APPROVALS.value
+
+        if not self._server:
+            await self._notification_manager.notify_command_error(
+                command, "Server is not running"
+            )
+            return
+
+        try:
+            pending = self._server.get_pending_approvals()
+            await self._notification_manager.notify_command_success(
+                command,
+                f"{len(pending)} pending approval(s)",
+                result_data={"pending": pending, "count": len(pending)},
+            )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
     @CommandHandler.register(DaemonCommand.EDIT_CLIENT)
     async def _handle_edit_client(self, params: Dict[str, Any]) -> None:
         """Edit a client configuration (server only)"""
@@ -2107,6 +2206,48 @@ class Daemon:
                     else "No OTP needed",
                 },
             )
+        except Exception as e:
+            await self._notification_manager.notify_command_error(command, f"{str(e)}")
+
+    @CommandHandler.register(DaemonCommand.REQUEST_PAIRING)
+    async def _handle_request_pairing(self, params: Dict[str, Any]) -> None:
+        """Ask the configured server to auto-generate an OTP (client only).
+
+        Lets the GUI offer a manual "Request OTP" button as a fallback when
+        the automatic request fired by the connection flow didn't reach the
+        server (e.g. server was not yet running at first attempt).
+        """
+        command = DaemonCommand.REQUEST_PAIRING.value
+
+        if not self._client:
+            await self._notification_manager.notify_command_error(
+                command, "Client not initialized"
+            )
+            return
+
+        try:
+            host = params.get("host")
+            port = params.get("port")
+            timeout = params.get("timeout", 5)
+
+            kwargs: Dict[str, Any] = {"timeout": timeout}
+            if host:
+                kwargs["server_host"] = host
+            if port:
+                kwargs["server_port"] = port
+
+            success, ttl, err = await self._client.request_pairing(**kwargs)
+
+            if success:
+                await self._notification_manager.notify_command_success(
+                    command,
+                    "Pairing request sent",
+                    result_data={"otp_validity_seconds": ttl},
+                )
+            else:
+                await self._notification_manager.notify_command_error(
+                    command, f"Pairing request failed: {err or 'unknown'}"
+                )
         except Exception as e:
             await self._notification_manager.notify_command_error(command, f"{str(e)}")
 

@@ -66,6 +66,7 @@ class NotificationEventType(str, Enum):
     OTP_VALIDATED = "otp_validated"
     OTP_INVALID = "otp_invalid"
     OTP_GENERATED = "otp_generated"
+    PAIRING_REQUESTED = "pairing_requested"
     SSL_HANDSHAKE_STARTED = "ssl_handshake_started"
     SSL_HANDSHAKE_COMPLETED = "ssl_handshake_completed"
     SSL_HANDSHAKE_FAILED = "ssl_handshake_failed"
@@ -83,6 +84,8 @@ class NotificationEventType(str, Enum):
     CLIENT_ADDED = "client_added"
     CLIENT_REMOVED = "client_removed"
     CLIENT_UPDATED = "client_updated"
+    CLIENT_APPROVAL_REQUESTED = "client_approval_requested"
+    CLIENT_APPROVAL_RESOLVED = "client_approval_resolved"
 
     # Stream events
     STREAM_ENABLED = "stream_enabled"
@@ -338,6 +341,41 @@ class OtpGeneratedEvent(NotificationEvent):
 
 
 @dataclass
+class PairingRequestEvent(NotificationEvent):
+    """A client asked the server to start the pairing/cert-sharing flow.
+
+    The OTP is included so the GUI can surface it to the admin without a
+    second event. The OTP still travels only inside the daemon→GUI IPC
+    channel — it never leaves the server host over the network.
+    """
+
+    def __init__(
+        self,
+        otp: str,
+        timeout: int,
+        peer_ip: str,
+        hostname: str = "",
+        was_active: bool = False,
+        **kwargs,
+    ):
+        data = {
+            "otp": otp,
+            "timeout": timeout,
+            "peer_ip": peer_ip,
+            "hostname": hostname,
+            "was_active": was_active,
+        }
+        data.update(kwargs)
+        display = hostname or peer_ip or "unknown client"
+        super().__init__(
+            event_type=NotificationEventType.PAIRING_REQUESTED,
+            data=data,
+            source="server",
+            message=f"{display} requested pairing",
+        )
+
+
+@dataclass
 class OtpNeededEvent(NotificationEvent):
     """OTP is required for authentication"""
 
@@ -416,6 +454,76 @@ class ServerChoiceMadeEvent(NotificationEvent):
             event_type=NotificationEventType.SERVER_CHOICE_MADE,
             data=data,
             message=f"Selected server {server_host}:{server_port}",
+        )
+
+
+@dataclass
+class ClientApprovalRequestedEvent(NotificationEvent):
+    """An unknown client is trying to connect and is awaiting admin decision.
+
+    The connection is held in a pending state on the server until the admin
+    calls ``approve_client`` (with a chosen screen position) or ``deny_client``
+    via the daemon. A timeout enforces eventual cleanup.
+    """
+
+    def __init__(
+        self,
+        peer_ip: str,
+        hostname: str = "",
+        uid: str = "",
+        request_id: str = "",
+        timeout: int = 60,
+        **kwargs,
+    ):
+        data = {
+            "peer_ip": peer_ip,
+            "hostname": hostname,
+            "uid": uid,
+            "request_id": request_id,
+            "timeout": timeout,
+        }
+        data.update(kwargs)
+        display = hostname or peer_ip or "unknown client"
+        super().__init__(
+            event_type=NotificationEventType.CLIENT_APPROVAL_REQUESTED,
+            data=data,
+            source="server",
+            message=f"{display} is waiting to be approved",
+        )
+
+
+@dataclass
+class ClientApprovalResolvedEvent(NotificationEvent):
+    """An admin has accepted or rejected a pending client connection.
+
+    Emitted so the GUI can take down the inline allow/deny prompt for that
+    client even when the decision was triggered elsewhere (e.g. timeout, or
+    a second window).
+    """
+
+    def __init__(
+        self,
+        peer_ip: str,
+        approved: bool,
+        request_id: str = "",
+        screen_position: str = "",
+        reason: str = "",
+        **kwargs,
+    ):
+        data = {
+            "peer_ip": peer_ip,
+            "approved": approved,
+            "request_id": request_id,
+            "screen_position": screen_position,
+            "reason": reason,
+        }
+        data.update(kwargs)
+        verb = "approved" if approved else "denied"
+        super().__init__(
+            event_type=NotificationEventType.CLIENT_APPROVAL_RESOLVED,
+            data=data,
+            source="server",
+            message=f"Client {peer_ip} {verb}",
         )
 
 
