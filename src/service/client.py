@@ -32,6 +32,7 @@ from model.client import ClientObj, ClientsManager
 from event.bus import AsyncEventBus
 from event.notification import (
     NotificationEvent,
+    CertificateStaleEvent,
     ConnectedEvent,
     DisconnectedEvent,
     OtpNeededEvent,
@@ -529,9 +530,34 @@ class Client:
                 self._logger.error("Received empty certificate data")
                 return False
 
-            # Save certificate
+            # Save certificate. Falling back to the resolved server host
+            # when the UID is missing prevents the cert from being saved
+            # as ``ca_.crt`` (empty source_id) — a degenerate state that
+            # collides with every other empty-uid client and breaks the
+            # mapping lookup. The UID stays the preferred key when known.
+            primary_id = self.config.get_server_uid()
+            if not primary_id:
+                resolved = self._cert_receiver.get_resolved_host()
+                primary_id = resolved or self.config.get_server_host() or ""
+                if not primary_id:
+                    self._logger.error(
+                        "Cannot save certificate: no UID, host, or resolved address"
+                    )
+                    return False
+                # Promote the fallback identifier into the config UID, so
+                # later lookups (``has_certificate``, ``_load_certificate``,
+                # ``_handle_certificate_check``) keep finding the cert. The
+                # original choose_server flow normally fills this in; we
+                # only end up here for manual-config or daemon-restart
+                # scenarios where the UID never made it to disk.
+                self.config.set_server_connection(uid=primary_id)
+                asyncio.create_task(self.config.save())
+                self._logger.warning(
+                    f"Server UID was empty; using fallback {primary_id!r} "
+                    f"as both source_id and persisted server UID"
+                )
             if not self._cert_manager.save_ca_data(
-                data=cert_data, source_id=self.config.get_server_uid()
+                data=cert_data, source_id=primary_id
             ):
                 self._logger.error("Failed to save received certificate")
                 return False
@@ -764,6 +790,11 @@ class Client:
                     hostname=service.hostname,
                     port=service.port,
                 )
+                # Persist the choice to disk so a daemon restart (or a Client
+                # re-instantiation) keeps the server UID. Without this, the
+                # next pairing flow would save the certificate with an empty
+                # source_id (producing ``ca_.crt`` and orphan mapping rows).
+                asyncio.create_task(self.config.save())
                 # Set the server future result in case someone is waiting for it
                 if not self._server.done():
                     self._server.set_result(service)
@@ -1016,6 +1047,8 @@ class Client:
                         connected_callback=self._on_connected,
                         disconnected_callback=self._on_disconnected,
                         reconnected_callback=self._on_streams_reconnected,
+                        stale_cert_callback=self._on_stale_certificate,
+                        server_uid_callback=self._on_server_uid_received,
                         host=self.config.get_server_host(),
                         port=self.config.get_server_port(),
                         heartbeat_interval=self.config.get_heartbeat_interval(),
@@ -1448,6 +1481,101 @@ class Client:
                 client_screen=client.get_screen_position(), streams=streams
             ),
         )
+
+    async def _on_server_uid_received(self, uid: str) -> None:
+        """Persist the server UID announced in the handshake ack.
+
+        Keeps the local config in sync with what the server actually
+        identifies as, so the cert-mapping key matches even when the
+        pairing started from a manual host/port (no mDNS discovery) or
+        the saved config drifted across restarts.
+        """
+        if not uid:
+            return
+        current = self.config.get_server_uid()
+        if current == uid:
+            return
+        self._logger.info(
+            f"Updating server UID from {current!r} to {uid!r} (from handshake)"
+        )
+        self.config.set_server_connection(uid=uid)
+        try:
+            await self.config.save()
+        except Exception as e:
+            self._logger.warning(f"Could not persist updated server UID ({e})")
+
+    async def _on_stale_certificate(self) -> None:
+        """Recover from a server cert that no longer verifies.
+
+        Triggered by the ConnectionHandler when TLS verification fails
+        (typically because the server regenerated its CA). The stored copy
+        is useless: delete it, reset the OTP-await futures, surface a clear
+        message to the GUI, and schedule a full Client.stop() so the next
+        Start cycle goes through ``_handle_certificate_check`` cleanly and
+        re-triggers the OTP pairing flow.
+        """
+        server_uid = self.config.get_server_uid() or ""
+        server_host = self.config.get_server_host() or ""
+        server_hostname = self.config.get_server_hostname() or ""
+
+        try:
+            # The cert mapping may carry multiple aliases for the same file
+            # (UID, resolved IP, hostname). Pass every identifier we know
+            # so ``remove_ca_data`` wipes file + every alias in one pass —
+            # if we only matched the UID, an orphan IP/hostname alias would
+            # keep pointing at a deleted file and confuse later lookups.
+            removed = self._cert_manager.remove_ca_data(
+                server_uid, server_host, server_hostname
+            )
+            if removed:
+                self._logger.warning(
+                    f"Removed stale CA certificate (uid={server_uid!r}, "
+                    f"host={server_host!r}, hostname={server_hostname!r})"
+                )
+            else:
+                self._logger.warning(
+                    f"No stale CA certificate found for server "
+                    f"(uid={server_uid!r}, host={server_host!r}, "
+                    f"hostname={server_hostname!r})"
+                )
+        except Exception as e:
+            self._logger.error(f"Failed to remove stale certificate ({e})")
+
+        # Force-reset the pairing futures unconditionally: in a successful
+        # previous run ``_otp_needed`` ends with result False (done state),
+        # but a fresh ``set_result(True)`` on a done future raises
+        # InvalidStateError. Replacing them outright is safe — anyone still
+        # awaiting them would have been cancelled already by the
+        # disconnection that just preceded this callback.
+        async with self._state_lock:
+            for fut in (self._otp_needed, self._otp_received):
+                if not fut.done():
+                    fut.cancel()
+            self._otp_needed = asyncio.Future()
+            self._otp_received = asyncio.Future()
+
+        await self._send_notification(
+            CertificateStaleEvent(server_uid=server_uid, server_host=server_host)
+        )
+
+        # Tear the Client down so the GUI's Start button works again and
+        # the next start goes through the full pairing path. Scheduling it
+        # as a separate task avoids deadlocking the ConnectionHandler core
+        # loop, which is the task currently invoking this callback.
+        if self._running:
+            asyncio.create_task(self._stop_after_stale_cert())
+
+    async def _stop_after_stale_cert(self) -> None:
+        """Run ``stop()`` outside the ConnectionHandler's call stack.
+
+        Wrapping the call so we can swallow errors quietly: the cert is
+        already gone and the notification already fired, so a clean stop
+        is best-effort.
+        """
+        try:
+            await self.stop()
+        except Exception as e:
+            self._logger.error(f"Error stopping client after stale cert ({e})")
 
     # ==================== Utility Methods ====================
 
