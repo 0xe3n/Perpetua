@@ -23,6 +23,7 @@ Provides a clean interface to configure and manage server components.
 
 import asyncio
 import socket
+import sys
 
 from typing import Optional, Dict, Tuple, Callable, Awaitable
 
@@ -71,6 +72,19 @@ from utils.crypto.sharing import CertificateSharing
 from utils.logging import get_logger
 
 from . import ServiceDiscovery
+
+
+class ServerStartError(Exception):
+    """Raised by :meth:`Server.start` when startup fails for a known,
+    user-actionable reason. The daemon surfaces ``str(exc)`` directly as the
+    CommandError message so the GUI shows a useful description without us
+    having to fire a second notification event.
+    """
+
+    def __init__(self, message: str, reason: str = "", **details):
+        super().__init__(message)
+        self.reason = reason
+        self.details = details
 
 
 class Server:
@@ -347,7 +361,7 @@ class Server:
     async def start_pairing_service(
         self,
         host: Optional[str] = None,
-        port: int = ServerConfig.DEFAULT_PORT - 2,
+        port: Optional[int] = None,
     ) -> bool:
         """
         Start the always-on pairing/cert-sharing listener.
@@ -379,10 +393,14 @@ class Server:
             return False
 
         bind_host = host if host is not None else "0.0.0.0"
+        # Resolve effective pairing port: explicit arg -> config override ->
+        # legacy "port - 2" convention. Keeping the resolution centralised so
+        # both server.py and the mDNS TXT record agree.
+        bind_port = port if port is not None else self.config.get_pairing_port()
         self._cert_sharing = CertificateSharing(
             cert_data=cert_data,
             host=bind_host,
-            port=port,
+            port=bind_port,
             timeout=30,
             pairing_request_callback=self._on_pairing_requested,
         )
@@ -391,7 +409,22 @@ class Server:
         if not ok:
             self._logger.error("Failed to start pairing service")
             self._cert_sharing = None
-        return ok
+            return False
+
+        actual = self._cert_sharing.get_actual_port()
+        if actual is not None and actual != bind_port:
+            self._logger.info(
+                f"Pairing service bound to fallback port {actual} "
+                f"(preferred {bind_port} was occupied)"
+            )
+        return True
+
+    def get_pairing_actual_port(self) -> Optional[int]:
+        """Return the port the pairing listener actually bound to (with
+        fallback applied), or None if not running."""
+        if self._cert_sharing is None:
+            return None
+        return self._cert_sharing.get_actual_port()
 
     async def _on_pairing_requested(self, info: Dict[str, str]) -> None:
         """Bridge a pairing request from CertificateSharing into notifications.
@@ -429,7 +462,7 @@ class Server:
     async def share_certificate(
         self,
         host: str = "0.0.0.0",
-        port: int = ServerConfig.DEFAULT_PORT - 2,
+        port: Optional[int] = None,
         timeout: int = 30,
     ) -> Tuple[bool, Optional[str]]:
         """
@@ -457,6 +490,8 @@ class Server:
             self._logger.error("No certificates available to share")
             return False, None
 
+        bind_port = port if port is not None else self.config.get_pairing_port()
+
         # Fast path: pairing service already up — just refresh the OTP.
         if self._cert_sharing and self._cert_sharing.is_sharing_active():
             otp, remaining = await self._cert_sharing.ensure_active_otp(timeout=timeout)
@@ -477,7 +512,7 @@ class Server:
             self._cert_sharing = CertificateSharing(
                 cert_data=cert_data,
                 host=host,
-                port=port,
+                port=bind_port,
                 timeout=timeout,
                 pairing_request_callback=self._on_pairing_requested,
             )
@@ -935,6 +970,31 @@ class Server:
             if not fut.done()
         ]
 
+    @staticmethod
+    def _is_port_available(host: str, port: int) -> bool:
+        """Synchronously probe whether ``host:port`` is free for bind.
+
+        Mirrors what ``asyncio.start_server`` would actually attempt: on POSIX
+        the event loop sets ``SO_REUSEADDR`` by default, so sockets stuck in
+        ``TIME_WAIT`` from a previous incarnation don't block a fresh bind.
+        Without ``SO_REUSEADDR`` here this probe was reporting "port busy"
+        for ~60s after every stop, even though the real start would have
+        succeeded fine.
+
+        On Windows ``SO_REUSEADDR`` has different (looser) semantics; setting
+        it would let two unrelated servers steal each other's port, so we
+        keep the probe strict there to match the OS behaviour.
+        """
+        bind_host = host if host and host != "0.0.0.0" else ""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if sys.platform != "win32":
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((bind_host, port))
+            return True
+        except OSError:
+            return False
+
     # ==================== Server Lifecycle ====================
 
     async def start(self) -> bool:
@@ -945,6 +1005,26 @@ class Server:
 
         self._logger.info("Starting Server...")
 
+        # Pre-flight check: refuse to start if the configured TCP data port
+        # is already taken. Unlike the pairing port (which auto-falls-back
+        # to adjacent ports), the data port is published over mDNS and used
+        # by client configs, so a silent fallback would confuse everything.
+        # Surface the conflict explicitly so the GUI can prompt the admin to
+        # change the port in Options.
+        if not self._is_port_available(self.config.host, self.config.port):
+            error_msg = (
+                f"Port {self.config.port} is already in use on "
+                f"{self.config.host or 'all interfaces'}. "
+                f"Change the port in Options and try again."
+            )
+            self._logger.error(error_msg)
+            raise ServerStartError(
+                error_msg,
+                reason="port_in_use",
+                port=self.config.port,
+                host=self.config.host,
+            )
+
         # Initialize and start enabled streams
         try:
             await self._initialize_streams()
@@ -953,7 +1033,6 @@ class Server:
             await self.stop(True)
             return False
 
-        # TODO: We should check if port is available before starting by using ServiceDiscovery utils
         # Initialize connection handler
         self.connection_handler = ConnectionHandler(
             connected_callback=self._on_client_connected,
@@ -968,17 +1047,6 @@ class Server:
             approval_callback=self._request_client_approval,
         )
 
-        # Start mDNS service
-        try:
-            service_task = asyncio.create_task(
-                self._mdns_service.register_service(
-                    host=self.config.host, port=self.config.port, uid=self.config.uid
-                )
-            )
-        except RuntimeError as re:
-            self._logger.warning(f"Failed to start mDNS service ({re})")
-            # TODO: Should we stop on fail? mDNS is not critical
-
         # Initialize and start enabled components
         try:
             await self._initialize_components()
@@ -986,6 +1054,45 @@ class Server:
             self._logger.error(f"Failed to initialize components ({e})")
             await self.stop(True)
             return False
+
+        if not await self.connection_handler.start():
+            self._logger.error("Failed to start connection handler")
+            await self.stop(True)
+            return False
+
+        # Bring up the pairing/cert-sharing listener BEFORE mDNS so the
+        # service record advertises the port we actually bound (the listener
+        # may have fallen back to an adjacent port if the preferred one was
+        # busy). Failure is non-fatal — the rest of the server keeps running
+        # and the admin can still share certs manually via
+        # share_certificate().
+        if self.config.ssl_enabled:
+            try:
+                await self.start_pairing_service(host=self.config.host)
+            except Exception as e:
+                self._logger.warning(f"Pairing service did not start ({e})")
+
+        # Start mDNS service. Advertise the pairing port so clients can
+        # discover it without relying on the legacy ``port - 2`` convention.
+        # Prefer the actually-bound port over the configured one so the
+        # advertisement reflects reality after fallback.
+        actual_pairing = self.get_pairing_actual_port()
+        advertised_pairing = (
+            actual_pairing if actual_pairing else self.config.get_pairing_port()
+        )
+        extra_props = {"pairing_port": str(advertised_pairing)}
+        try:
+            service_task = asyncio.create_task(
+                self._mdns_service.register_service(
+                    host=self.config.host,
+                    port=self.config.port,
+                    uid=self.config.uid,
+                    extra_props=extra_props,
+                )
+            )
+        except RuntimeError as re:
+            self._logger.warning(f"Failed to start mDNS service ({re})")
+            # TODO: Should we stop on fail? mDNS is not critical
 
         try:
             await service_task
@@ -1000,21 +1107,6 @@ class Server:
             self._logger.error(f"Failed to start mDNS service ({e})")
             await self.stop(True)
             return False
-
-        if not await self.connection_handler.start():
-            self._logger.error("Failed to start connection handler")
-            await self.stop(True)
-            return False
-
-        # Bring up the pairing/cert-sharing listener so clients can request an
-        # OTP without the admin having to push a button first. Failure is
-        # non-fatal: the rest of the server keeps running, the admin can still
-        # share certs manually via share_certificate().
-        if self.config.ssl_enabled:
-            try:
-                await self.start_pairing_service(host=self.config.host)
-            except Exception as e:
-                self._logger.warning(f"Pairing service did not start ({e})")
 
         self._running = True
         self._logger.info(f"Server started on {self.config.host}:{self.config.port}")
