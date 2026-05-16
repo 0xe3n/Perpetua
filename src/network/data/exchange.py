@@ -258,12 +258,18 @@ class MessageExchange:
             buffer_len = len(persistent_buffer)
             offset = 0
 
+            # Wrap the buffer once in a memoryview so prefix/body slicing
+            # below stays zero-copy. msgspec and struct.unpack* accept
+            # memoryview directly, avoiding a `bytes()` alloc per message
+            # (hot on mouse-stream at high event rates).
+            buffer_view = memoryview(persistent_buffer)
+
             # Process all complete messages in the buffer
             while offset + prefix_len <= buffer_len:
                 try:
                     # If prefix is invalid, this will raise ValueError and we will skip 1 byte
                     msg_length = ProtocolMessage.read_lenght_prefix(
-                        bytes(persistent_buffer[offset : offset + prefix_len]), False
+                        buffer_view[offset : offset + prefix_len], False
                     )
 
                     if msg_length > max_msg_size:
@@ -288,12 +294,11 @@ class MessageExchange:
                             )
                         break
 
-                    # Extract and process the complete message
-                    message_data = bytes(
-                        persistent_buffer[offset : offset + total_length]
-                    )
+                    # Extract and process the complete message (zero-copy slice).
                     message = ProtocolMessage.from_bytes(
-                        message_data, validate=False, length=msg_length
+                        buffer_view[offset : offset + total_length],
+                        validate=False,
+                        length=msg_length,
                     )
                     # message.timestamp = time()
                     if message.timestamp:
@@ -334,6 +339,9 @@ class MessageExchange:
                         self._metrics.connection_errors += 1
                     await asyncio.sleep(0)
                     continue
+
+            # Release the memoryview
+            buffer_view.release()
 
             # Remove processed data from buffer
             if offset > 0:
@@ -388,24 +396,45 @@ class MessageExchange:
         """
         Core loop for receiving and processing incoming messages.
         Handles chunk reassembly and dispatching to registered handlers.
+
+        Network-level disconnect exceptions are swallowed at the loop
+        boundary so the task does not surface "Task exception was never
+        retrieved" - the connection layer is responsible for handling
+        teardown; this loop just stops cleanly.
         """
         buffers: Dict[str, bytearray] = {}
         prefix_len = ProtocolMessage.prefix_lenght
         max_msg_size = self.config.max_chunk_size * 100
 
-        while self._running:
-            await asyncio.sleep(0)
-            callbacks_snapshot = list(self._receive_callbacks.items())
-            for tr_id, receive_callback in callbacks_snapshot:
-                if tr_id not in buffers:
-                    buffers[tr_id] = bytearray()
-                await self._receive_logic(
-                    receive_callback,
-                    buffers[tr_id],
-                    prefix_len,
-                    max_msg_size,
-                )
+        try:
+            while self._running:
                 await asyncio.sleep(0)
+                callbacks_snapshot = list(self._receive_callbacks.items())
+                for tr_id, receive_callback in callbacks_snapshot:
+                    if tr_id not in buffers:
+                        buffers[tr_id] = bytearray()
+                    await self._receive_logic(
+                        receive_callback,
+                        buffers[tr_id],
+                        prefix_len,
+                        max_msg_size,
+                    )
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            self._logger.log(
+                f"Receive loop {self._id} ended on disconnect "
+                f"(exc_type={type(e).__name__}, exc={e!r})",
+                Logger.DEBUG,
+            )
+            self._running = False
 
     async def set_transport(
         self,

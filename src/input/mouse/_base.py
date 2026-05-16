@@ -18,8 +18,8 @@
 import asyncio
 from collections import deque
 from typing import Optional
-from time import time, sleep
-from threading import Event
+from time import time
+from threading import Event, Lock
 
 from event import (
     BusEventType,
@@ -80,6 +80,12 @@ class ServerMouseListener(object):
         self._cross_screen_event = Event()
         self._cross_screen_lock = asyncio.Lock()
         self._handling_cross_screen = False
+        # threading.Lock for state shared between the pynput listener thread
+        # and the asyncio event loop (`_handling_cross_screen` flag and
+        # `_movement_history` deque). Held only across O(1) operations; NEVER
+        # held across an `await`.
+        self._server_state_lock = Lock()
+        self._button_pressed: set[int] = set()  # Track pressed buttons
 
         # Check platform to set appropriate mouse filter
         self._filter_args = {}
@@ -167,12 +173,25 @@ class ServerMouseListener(object):
         self._logger.debug("Started.")
         return True
 
+    LISTENER_JOIN_TIMEOUT = 2.0  # sec - cap how long stop() will wait
+
     def stop(self) -> bool:
         """
-        Stops the mouse listener.
+        Stops the mouse listener. ``pynput.Listener.stop`` returns
+        immediately; we explicitly wait for the OS-level listener thread.
         """
         if self._listener is not None and self.is_alive():
             self._listener.stop()
+            try:
+                self._listener.join(timeout=self.LISTENER_JOIN_TIMEOUT)
+            except RuntimeError:
+                # join() raises if the thread never started; safe to ignore.
+                pass
+            if self._listener.is_alive():
+                self._logger.warning(
+                    "Mouse listener thread still alive after "
+                    f"{self.LISTENER_JOIN_TIMEOUT}s - proceeding without join"
+                )
         self._logger.debug("Stopped.")
         return True
 
@@ -227,13 +246,21 @@ class ServerMouseListener(object):
         active_screen = data.active_screen
 
         if active_screen is not None:
-            self._movement_history.clear()
+            with self._server_state_lock:
+                self._movement_history.clear()
             self._listening = True
             self._cross_screen_event.clear()
         else:
             self._listening = False
 
         await asyncio.sleep(0)
+
+    def _screen_size_valid(self) -> bool:
+        """Guard against (0,0) or negative dimensions (display disconnected
+        / not yet probed). Prevents ZeroDivisionError and inf/nan
+        coordinates from propagating through the event stream.
+        """
+        return self._screen_size[0] > 0 and self._screen_size[1] > 0
 
     def _darwin_mouse_suppress_filter(self, event_type, event):
         raise NotImplementedError("Mouse suppress filter not implemented yet.")
@@ -247,18 +274,29 @@ class ServerMouseListener(object):
         While not listening, it needs to check if the cursor is reaching the screen edges.
         Since pynput runs in its own thread, we need to schedule async operations.
         """
-        if self._cross_screen_event.is_set() or self._handling_cross_screen:
+        if not self._screen_size_valid():
             return True
+        # Snapshot the cross-screen guard atomically under the shared state
+        # lock - `_handling_cross_screen` is mutated by `_handle_cross_screen`
+        # on the event loop, and concurrent moves must observe a consistent
+        # value to avoid two simultaneous cross-screen handlers.
+        with self._server_state_lock:
+            if self._cross_screen_event.is_set() or self._handling_cross_screen:
+                return True
+            should_buffer = not self._listening
+            if should_buffer:
+                try:
+                    self._movement_history.append((x, y))
+                except Exception:
+                    pass
+            history_ready = (
+                should_buffer
+                and len(self._movement_history) >= self.MOVEMENT_HISTORY_N_THRESHOLD
+            )
 
         # The border check has to take in account only when we are moving forward and not backward or staying still
         if not self._listening:
-            # Add the current position to the movement history
-            try:
-                self._movement_history.append((x, y))
-            except Exception:
-                pass
-
-            if len(self._movement_history) >= self.MOVEMENT_HISTORY_N_THRESHOLD:
+            if history_ready:
                 # Check all the previous movements to determine the direction
                 edge = EdgeDetector.is_at_edge(
                     movement_history=self._movement_history,
@@ -268,7 +306,7 @@ class ServerMouseListener(object):
                     is_dragging=self._is_dragging,
                 )
                 if edge is None:
-                    sleep(0)
+                    # No edge reached yet; nothing more to do for this event.
                     return True
 
                 mouse_event = MouseEvent(x=x, y=y, action=MouseEvent.POSITION_ACTION)
@@ -360,17 +398,25 @@ class ServerMouseListener(object):
         self, edge: ScreenEdge, mouse_event: MouseEvent, screen: str
     ):
         """Async handler for cross-screen events"""
-        # reset movement history
+        # Mark the cross-screen handler as in-flight under the shared state
+        # lock so concurrent `on_move` calls observe it. The flag is reset
+        # in the finally block - also under the lock.
+        with self._server_state_lock:
+            self._handling_cross_screen = True
         try:
             # Acquire lock to serialize cross-screen handling
             async with self._cross_screen_lock:
+                with self._server_state_lock:
+                    history_len = len(self._movement_history)
                 if (
-                    len(self._movement_history) < self.MOVEMENT_HISTORY_N_THRESHOLD
+                    history_len < self.MOVEMENT_HISTORY_N_THRESHOLD
                 ):  # Check again because of async
                     return
 
-                # Reset movement history
-                self._movement_history.clear()
+                # Reset movement history under the shared state lock since
+                # the pynput thread may concurrently append to it.
+                with self._server_state_lock:
+                    self._movement_history.clear()
 
                 # We notify the system that an active screen change has occurred
                 await self.event_bus.dispatch(
@@ -386,24 +432,37 @@ class ServerMouseListener(object):
         except Exception as e:
             self._logger.error(f"Error handling cross-screen ({e})")
         finally:
-            # Resetta gli stati solo dopo il completamento di tutte le operazioni async
-            self._handling_cross_screen = False
+            # Reset states under the shared lock so the pynput thread sees a
+            # consistent flag transition.
+            with self._server_state_lock:
+                self._handling_cross_screen = False
             self._cross_screen_event.clear()
 
     def on_click(self, x, y, button: Button, pressed):
         if self._listening:
+            if not self._screen_size_valid():
+                return True
+            button = ButtonMapping[button.name].value
             mouse_event = MouseEvent(
                 x=x / self._screen_size[0],
                 y=y / self._screen_size[1],
-                button=ButtonMapping[button.name].value,
+                button=button,
                 action=MouseEvent.CLICK_ACTION,
                 is_presed=pressed,
             )
             try:
                 # Schedule async send
+                if not pressed and button in self._button_pressed:
+                    self._button_pressed.remove(button)
+                elif pressed:
+                    self._button_pressed.add(button)
+                else:
+                    return True  # Ignore this event
+
                 self._schedule_async(self.stream.send(mouse_event))
             except Exception as e:
                 self._logger.error(f"Failed to dispatch mouse click event ({e})")
+
         else:
             # Track dragging state to avoid edge crossing
             self._is_dragging = pressed and ButtonMapping[button.name].value in [
@@ -477,11 +536,17 @@ class ServerMouseController(object):
         Position the mouse cursor to the specified (x, y) coordinates.
         """
         try:
-            # Denormalize coordinates by mapping into the client screen size
-            x *= self._screen_size[0]
-            y *= self._screen_size[1]
-            x = int(x)
-            y = int(y)
+            # Denormalize coordinates by mapping into the client screen size.
+            # Skip silently if screen size is unknown (display disconnected /
+            # not yet probed) to avoid pinning the cursor at (0,0).
+            w, h = self._screen_size
+            if w <= 0 or h <= 0:
+                return
+            # round() over int(): int() truncates and accumulates sub-pixel
+            # bias on repeated cross-screen round-trips. Clamp to [0, w-1] / [0, h-1] so a peer that sends
+            # values slightly >1.0 (rounding noise) doesn't land off-screen.
+            x = max(0, min(w - 1, round(x * w)))
+            y = max(0, min(h - 1, round(y * h)))
         except ValueError:
             self._logger.log(f"Invalid x or y values: x={x}, y={y}", Logger.ERROR)
             return
@@ -818,11 +883,15 @@ class ClientMouseController(object):
         Position the mouse cursor to the specified (x, y) coordinates.
         """
         try:
-            # Denormalize coordinates by mapping into the client screen size
-            x *= self._screen_size[0]
-            y *= self._screen_size[1]
-            x = int(x)
-            y = int(y)
+            # Denormalize coordinates by mapping into the client screen size.
+            # round() + clamp: int() truncation introduces sub-pixel jitter
+            # on every cross-screen round-trip; clamping prevents off-screen
+            # positions when a peer sends slightly out-of-range floats.
+            w, h = self._screen_size
+            if w <= 0 or h <= 0:
+                return
+            x = max(0, min(w - 1, round(x * w)))
+            y = max(0, min(h - 1, round(y * h)))
         except ValueError:
             return
 
@@ -852,11 +921,13 @@ class ClientMouseController(object):
             self._controller.move(dx=dx, dy=dy)
         else:
             try:
-                # Denormalize coordinates by mapping into the client screen size
-                x *= self._screen_size[0]
-                y *= self._screen_size[1]
-                x = int(x)
-                y = int(y)
+                # Denormalize coordinates by mapping into the client screen
+                # size. round() + clamp for smooth, in-bounds positioning.
+                w, h = self._screen_size
+                if w <= 0 or h <= 0:
+                    return
+                x = max(0, min(w - 1, round(x * w)))
+                y = max(0, min(h - 1, round(y * h)))
             except ValueError:
                 return
 
